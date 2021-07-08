@@ -24,6 +24,7 @@
 #include "Adafruit_NeoPixel.h"           // Adafruit Neopixel
 #include "LSM303.h"                 // Pololu LSM303
 #include "TinyGPS++.h"              // GPS NMEA parsing
+#include "SoftwareSerial.h"
 
 /* ======================= Constants =============================== */
 
@@ -31,7 +32,9 @@
 #define PIXEL_PIN           15
 #define PIXEL_COUNT         24
 
-static const int RXPin = 16, TXPin = 17;
+static const int RXPin = 3, TXPin = 1;
+const unsigned int writeInterval = 25000; // write interval (in ms)
+static const uint32_t GPSBaud = 9600;
 
 SoftwareSerial ss(RXPin, TXPin); // The serial connection to the GPS device
 
@@ -72,7 +75,7 @@ unsigned long lastPublishTime = 0;
 unsigned long lastBlinkTime = 0;
 
 // Neopixel LEDs
-Adafruit_NeoPixel strip(PIXEL_COUNT, PIXEL_PIN, , NEO_GRBW + NEO_KHZ800);
+Adafruit_NeoPixel strip(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
 // LSM303 Magnetometer (compass)
 LSM303 compass;
@@ -89,7 +92,6 @@ int direction_index;
 bool requestSent = false;
 bool requestRcv = false;
 void hookResponseHandler(const char *event, const char *data);
-
 
 /* ======================= Functions =============================== */
 
@@ -113,11 +115,6 @@ void setup()
   strip.show();
   strip.setBrightness(PIXEL_BRIGHTNESS);
   Serial.println("Done!");
-
-  // Wait for Particle to connect to the network
-  LED_SetAll(strip.Color(255, 255, 255), 0); // All LEDs on immediately after power-up
-  delay(5000);
-  LED_SetAll(strip.Color(0, 0, 0), 0); // Off
 
   // Wait for valid GPS fix
   Serial.print("[*] Waiting for GPS...");
