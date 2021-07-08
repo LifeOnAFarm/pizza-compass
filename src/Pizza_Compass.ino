@@ -1,4 +1,4 @@
-*
+/*
  * Project: Pizza Compass
  * Author: Joe Grand (@joegrand), Grand Idea Studio (www.grandideastudio.com)
  * Description: Digital compass that leads you to the nearest location of your choosing 
