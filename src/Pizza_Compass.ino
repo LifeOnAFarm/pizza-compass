@@ -1,282 +1,227 @@
 /*
- * Project: Pizza Compass
- * Author: Joe Grand (@joegrand), Grand Idea Studio (www.grandideastudio.com)
- * Description: Digital compass that leads you to the nearest location of your choosing 
- * no matter where you are in the world.
+ * Project: Beer Crawl Compass
+ * Author: Seamus de Cleir
+ * Description: Adapted from Joe Grand's (@joegrand) Pizza Compass (https://github.com/joegrand/pizza-compass/)
+ * This compass uses a ESP32, GY511, SIM800L, NEO 6M GPS and LED to lead the user to different pubs on a pub crawl
  * License: Creative Commons Attribution-NonCommercial 4.0 International (CC BY-NC 4.0)
  */
 
-/* LED states:
- * White: LED test at power-up
- * Spinning red: Connecting to Particle network
- * Spinning green: Waiting for valid GPS fix
- * Spinning blue: Waiting for compass calibration (short press to skip, press and hold to calibrate)
- * Solid blue: Compass calibration (spin around each axis like you're painting the inside of a sphere, press button when done)
- * Flashing blue: Compass error (can't communicate)
- * Rainbow/color wheel: Waiting to begin (press button to start)
- * Solid purple: Sending data request to Particle (local coordinates + search query)
- * Spinning purple: Waiting for response from Particle (target coordinates)
- */
+#include <Adafruit_NeoPixel.h>
+#include <NeoPatterns.h>
+#include <SoftwareSerial.h>
+#include <TinyGPS++.h>
+#include <LSM303.h>
+#include <Wire.h>
 
-/* ======================= Includes ================================= */
-
-// External libraries
-#include "Adafruit_NeoPixel.h"           // Adafruit Neopixel
-#include "LSM303.h"                 // Pololu LSM303
-#include "TinyGPS++.h"              // GPS NMEA parsing
-#include "SoftwareSerial.h"
-
-/* ======================= Constants =============================== */
+/* ************************* Variables ************************* */
 
 // PINs for Neo Ring
-#define PIXEL_PIN           15
+#define PIXEL_PIN           12
 #define PIXEL_COUNT         24
 
-static const int RXPin = 3, TXPin = 1;
-const unsigned int writeInterval = 25000; // write interval (in ms)
+// Length of button press required to enter calibration mode on start-up (in ms)
+#define COMPASS_CAL_DELAY   3000
+
+// Time between GPS/compass updates
+#define UI_INTERVAL_TIME    100
+
+// Distance to target (in meters) before LED's blink green
+#define UI_DISTANCE_ALERT   50.0
+
+// Blink time (in ms) for visual alert when we're within range of target
+#define UI_BLINK_TIME       250
+
+// Test variables
+#define GPS_TARGET_LAT      53.0978374      // Kinnitty
+#define GPS_TARGET_LNG      -7.7192709
+
+void Ring1Complete(NeoPatterns *aLedsPtr);
+
+// Set colour changing variable
+uint32_t LEDColour;
+
+// Neopixel LEDs
+NeoPatterns colourWipe = NeoPatterns(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800, &Ring1Complete);
+NeoPatterns rainbow = NeoPatterns(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
+
+// Pin definitions
+const int buttonStart = 2;
+static const uint32_t ConsoleBaud = 115200;
+unsigned long time_now = 0;
+
+//Baud rate for GY511
 static const uint32_t GPSBaud = 9600;
 
-SoftwareSerial ss(RXPin, TXPin); // The serial connection to the GPS device
+// Serial Pins
+static const int RXPin = 16, TXPin = 17;
 
-#define PIXEL_BRIGHTNESS    32     // 0 = low, 255 = high
-#define PIXEL_CYCLE_SPEED   5      // Speed of rainbow color wheel (in ms)
-#define PIXEL_WIPE_SPEED    50     // Speed of pixel wipe effect
+//GPS
+TinyGPSPlus gps;
+SoftwareSerial ss(RXPin, TXPin);
+double local_lat, local_lng;
+double target_lat, target_lng;
+double courseToNextPub;
+double distanceToNextPub;
+int direction_index;
 
-#define COMPASS_CAL_DELAY   3000   // Length of button press required to enter calibration mode on start-up (in ms)
+// LSM303 - GY511
+LSM303 compass;
 
-// Hard-coded GPS coordinates
-// https://www.gps-coordinates.net/
-#define GPS_LOCAL_LAT       40.6892532      // Statue of Liberty
-#define GPS_LOCAL_LNG       -74.0445482
+// If we haven't searched for pizza yet
+bool first_time = true;
 
-#define GPS_TARGET_LAT      37.8184509      // Golden Gate Bridge
-#define GPS_TARGET_LNG      -122.4784088
+// Blink LEDs if we are within range of target
+bool blinkFlag = false;
 
-#define GPS_BAUD            9600
-#define GPS_LOCATION_AGE    5000    // Time (in ms) before data is considered stale (e.g., we may have lost fix)
-
-#define UI_INTERVAL_TIME    100     // Time (in ms) to wait between GPS/compass updates
-#define UI_DISTANCE_ALERT   50.0    // Distance to target (in meters) in order to enable visual alert
-#define UI_BLINK_TIME       250     // Blink time (in ms) for visual alert when we're within range of target
-#define PARTICLE_CONSOLE_BAUD   115200
-
-
-/* ==================== Global Variables ============================ */
-
-// Pin definitionsb
-const int buttonStart = 8;     // External pushbutton
-const int gpsEnable = 9;       // GPS Enable pin (active HIGH)
-
-// UI
-bool first_time = true;         // If we haven't searched for pizza yet
-bool blinkFlag = false;         // Blink LEDs if we are within range of target
 unsigned long lastUpdateTime = 0;
 unsigned long lastPublishTime = 0;
 unsigned long lastBlinkTime = 0;
 
-// Neopixel LEDs
-Adafruit_NeoPixel strip(PIXEL_COUNT, PIXEL_PIN, NEO_GRB + NEO_KHZ800);
 
-// LSM303 Magnetometer (compass)
-LSM303 compass;
+/* ************************* Steup ************************* */
 
-// GPS
-TinyGPSPlus gps;
-double local_lat, local_lng;
-double target_lat, target_lng;
-double courseToPizza;   // Heading (in degrees) from our current location to the target
-double distanceToPizza; // Distance (in meters) from our current location to the target
-int direction_index;
+void setup() {
 
-// Particle
-bool requestSent = false;
-bool requestRcv = false;
-void hookResponseHandler(const char *event, const char *data);
-
-/* ======================= Functions =============================== */
-
-// setup() runs once, when the device is first turned on.
-void setup() 
-{
-  // Pin configuration
-  pinMode(gpsEnable, OUTPUT);
+  Wire.begin();
   pinMode(buttonStart, INPUT);
-
-  digitalWrite(gpsEnable, 1);  // Make sure the GPS module is active
-
-  Serial.begin(PARTICLE_CONSOLE_BAUD);
-  delay(5000);  // Give time for serial monitor to open
-
-  Serial.println("\n\nWelcome to Joe Grand's Pizza Compass!\n");
+  Serial.begin(ConsoleBaud);
 
   Serial.print("[*] Initializing Neopixels...");
-  strip.begin();
-  strip.clear();
-  strip.show();
-  strip.setBrightness(PIXEL_BRIGHTNESS);
+  rainbow.begin();
+  colourWipe.begin();
+  colourWipe.clear();
   Serial.println("Done!");
+
+  colourWipe.ColorSet(COLOR32_PURPLE_HALF);
+  colourWipe.show();
+  delay(1000);
+  colourWipe.clear();
 
   // Wait for valid GPS fix
   Serial.print("[*] Waiting for GPS...");
-  Serial1.begin(GPS_BAUD);
-  while (!Serial1);   // Wait until the serial port is ready
-  gps.encode(Serial1.read()); 
-  while (gps.location.isValid() == false)   // Wait until the valid first NMEA sentence with a fix is parsed
-  {
-    LED_ColorWipe(strip.Color(0, 255, 0), PIXEL_WIPE_SPEED); // Green
-    LED_ColorWipe(strip.Color(0, 0, 0), PIXEL_WIPE_SPEED); // Off
+  
+  // GPS baud rate
+  ss.begin(GPSBaud);
 
-    while (Serial1.available() > 0)  // Wait until there is data in the serial buffer
-    {
-      gps.encode(Serial1.read()); 
+  // Read GPS buffer
+  while (ss.available() > 0){
+    gps.encode(ss.read());
+  }
+
+  // Set Green LEDs to circle while GPS is found
+  LEDColour = COLOR32_GREEN_HALF;
+  colourWipe.ColorWipe(LEDColour, 80, 0, DIRECTION_UP);
+
+    // Wait until the GPS returns valid
+  while (gps.location.isValid() == false){
+    
+    colourWipe.update();
+    
+    // Continue to read buffer
+    while (ss.available() > 0){
+      gps.encode(ss.read());
     }
   }
-  //GPS_DisplayInfo();
+
+  // GPS Found
+  colourWipe.updateAndWaitForPatternToStop();
   Serial.println("Done!");
 
+  
   Serial.print("[*] Initializing magnetometer...");
-  //Wire.begin();
-  bool error = compass.init();   // Automatically detect type of LSM303
-  if (!error)
-  {
+  // Automatically detect type of LSM303
+  bool error = compass.init();
+  
+  if (!error){
+    // Cannot detect the LSM303
     Serial.println("Failed!");
-    Compass_Error();             // Cannot detect the LSM303
+    Compass_Error();
   }
-  else
-  {
-    compass.enableDefault();     // Initilize accelerometer and magnetometer
+  else{
+    // Initilize accelerometer and magnetometer
+    compass.enableDefault();
     Serial.println("Done!");
   }
 
   Serial.print("[*] Calibrating magnetometer...");
-  while (digitalRead(buttonStart) == 1) // Wait here for a button press
-  {
-    LED_ColorWipe(strip.Color(0, 0, 255), PIXEL_WIPE_SPEED); // Blue
-    LED_ColorWipe(strip.Color(0, 0, 0), PIXEL_WIPE_SPEED); // Off
+  
+  LEDColour = COLOR32_BLUE_HALF;
+  colourWipe.ColorWipe(LEDColour, 70, 0, DIRECTION_UP);
+
+   // Wait for a button press
+  while (digitalRead(buttonStart) == 0){
+    colourWipe.update();
   }
 
   // Calibrate the compass
-  Compass_Warmup();   // Discard initial values
+  Compass_Warmup();
+
+  colourWipe.clear();
 
   unsigned long start_time = millis();
-  bool new_cal = false;  // If button press is short, skip calibration and use default values
-  while (digitalRead(buttonStart) == 0)
-  {
-    if (millis() - start_time > COMPASS_CAL_DELAY)  // If button is held down for long enough...
-    {
-      LED_ColorWipe(strip.Color(0, 0, 255), PIXEL_WIPE_SPEED); // Blue
-      new_cal = true;  // Read new compass values to calculate minimum/maximum ranges
+  
+  // If button press is short, skip calibration and use default values
+  bool new_cal = false;
+
+  LEDColour = COLOR32_RED_HALF;
+  colourWipe.ColorSet(LEDColour);
+  
+  while (digitalRead(buttonStart) == 1){
+    colourWipe.show();
+    if (millis() - start_time > COMPASS_CAL_DELAY){
+      // Read new compass values to calculate minimum/maximum ranges
+      new_cal = true;
     }
   }
+  colourWipe.clear();
   Compass_Calibration(new_cal);   
-  delay(100);
-  if (new_cal)
-  {
+  
+  if (new_cal){
     Serial.println("Done!");
   }
-  else
-  {
+  else{
     Serial.println("Skipped!");
   }
-  LED_ColorWipe(strip.Color(0, 0, 0), PIXEL_WIPE_SPEED); // Off
+  
+  colourWipe.clear();
+  
   Compass_DisplayCalibration();
 
-  Serial.print("[*] Subscribing to Particle integration response event...");
-  
-  
-  while(digitalRead(buttonStart) == 0);  // Wait until button is released
-  delay(100);
+  compass.m_min = (LSM303::vector<int16_t>){-542,   -713,   -526};
+  compass.m_max = (LSM303::vector<int16_t>){+330,   +282,   +369};
 
-  // We're all set up and good to go!
-  Serial.print("[*] Waiting for button...");
 }
 
-/* ---------------------------------------------------------------- */
+/* ************************* Main Loop ************************* */
 
-// loop() runs over and over again, as quickly as it can execute.
-void loop() 
-{
-  while (first_time == true)   // Wait here until we begin pizza search for the first time
-  {
-      LED_RainbowCycle(PIXEL_CYCLE_SPEED);
+void loop(){
 
-      if (digitalRead(buttonStart) == 0)  // If the button is pressed
+  // Wait here for first search
+  while (first_time == true){   
+      rainbow.RainbowCycle(10);
+      rainbow.updateAndWaitForPatternToStop();
+      
+      // If the button is pressed
+      if (digitalRead(buttonStart) == 1)
       {
         Serial.println("Done!");
         first_time = false;
       }
   }
- 
-  // At this point, we assume the GPS retains a valid fix (no error checking for invalid/stale data)
-  while (Serial1.available() > 0)  // If characters have been received from the GPS...
-  {
-    gps.encode(Serial1.read());      // ...Push them into the GPS object
+
+  // Check buffer for GPS location
+  while (ss.available() > 0){
+    gps.encode(ss.read());
   }
 
-  if (digitalRead(buttonStart) == 0)  // Get coordinates of target based on our current location
-  {
-    delay(100); // Debounce
-    if (digitalRead(buttonStart) == 0) // If the button is still pressed...
-    {
-      if (requestSent == false && (millis() - lastPublishTime >= PARTICLE_PUBLISH_TIME))  // If we haven't sent a request recently
-      {
-        lastPublishTime = millis();
-        LED_ColorWipe(strip.Color(255, 0, 255), PIXEL_WIPE_SPEED); // Purple
-
-        while(digitalRead(buttonStart) == 0);  // Wait until button is released
-        delay(100);
-
-        Serial.printf("[*] Sending request to Particle...");
-
-        // Get current local GPS coordinates
-        local_lat = gps.location.lat();
-        local_lng = gps.location.lng();
-        
-        // Prepare data for query
-        // https://github.com/rickkas7/particle-webhooks
-        /* Set up Webhook custom template in Particle.io dashboard
-        * {
-        *  "event": "get_pizza",
-        *  "deviceID": "<YOUR_DEVICE_NAME>",
-        *  "url": "https://maps.googleapis.com/maps/api/place/textsearch/json",
-        *  "requestType": "GET",
-        *  "noDefaults": true,
-        *  "rejectUnauthorized": true,
-        *  "responseTemplate": "{{results.0.geometry.location.lat}},{{results.0.geometry.location.lng}},{{results.0.name}}",
-        *  "query": 
-        *   {
-        *     "query": "pizza",
-        *     "location": "{{lat}},{{lng}}",
-        *     "key": "<YOUR_GOOGLE_API_KEY>"
-        *   }
-        * }
-        */
-        requestSent = true;
-        requestRcv = false; // This flag will be set when a response is received from the Webhook
-        char data[256];
-        snprintf(data, sizeof(data), "{\"lat\":%.10g,\"lng\":%.10g}", local_lat, local_lng);
-        Serial.printf("-> Data: %s", data);
-        
-
-        LED_ColorWipe(strip.Color(0, 0, 0), PIXEL_WIPE_SPEED); // Off
-      }
-    }
-  }
-  else  // Display heading for us to follow
-  {
-    
-
-    if (requestRcv == true && (millis() - lastUpdateTime >= UI_INTERVAL_TIME))  // If we've received target coordinates back from Particle/Google API
-    {
+  if ( (millis() - lastUpdateTime >= UI_INTERVAL_TIME)){
       lastUpdateTime = millis();
       
-      requestSent = false;  // Clear flag so we can perform another request in the future
       Serial.printf("[*] Let's go!");
 
       // Get current local GPS coordinates
       local_lat = gps.location.lat();
       local_lng = gps.location.lng();
-      // target_lat and target_lng already exist via hookResponseHandler
 
       // Force hard-coded coordinates here for testing
       //local_lat = GPS_LOCAL_LAT;
@@ -287,54 +232,42 @@ void loop()
       Serial.printf("-> Local: %.10g,%.10g", local_lat, local_lng);
       Serial.printf("-> Target: %.10g,%.10g", target_lat, target_lng);
 
-      distanceToPizza = 
+      distanceToNextPub = 
       TinyGPSPlus::distanceBetween(
         local_lat,
         local_lng,
         target_lat, 
         target_lng);
 
-      courseToPizza = 
+      courseToNextPub = 
       TinyGPSPlus::courseTo(
         local_lat,
         local_lng,
         target_lat, 
         target_lng);
 
-      Serial.printf("-> Distance: %.6g meters", distanceToPizza);
-      Serial.printf("-> Course: %.6g [", courseToPizza);
-      Serial.print(TinyGPSPlus::cardinal(courseToPizza));
+      Serial.printf("-> Distance: %.6g meters", distanceToNextPub);
+      Serial.printf("-> Course: %.6g [", courseToNextPub);
+      Serial.print(TinyGPSPlus::cardinal(courseToNextPub));
       Serial.printf("]");
 
-      /*
-        When given no arguments, the heading() function returns the angular
-        difference in the horizontal plane between a default vector and
-        north, in degrees.
-            
-        To use a different vector as a reference, use the version of heading()
-        that takes a vector argument; for example, use
-            
-          compass.heading((LSM303::vector<int>){0, 0, 1});
-            
-        to use the +Z axis as a reference.
-      */
-      compass.read();  // Read new compass values
-      float heading = compass.heading((LSM303::vector<int>){1, 0, 0});  // Get heading using the +X axis as our reference
+      // Read new compass values
+      compass.read();
+      float heading = compass.heading((LSM303::vector<int>){1, 0, 0});
       Serial.printf("-> Current Heading: %d", (int)heading);
 
-      int courseChangeNeeded = (int)(360 + courseToPizza - heading) % 360;
+      int courseChangeNeeded = (int)(360 + courseToNextPub - heading) % 360;
       Serial.printf("-> Course Change: %d", courseChangeNeeded);
 
       // Divide to find which pie slice it's in (360 degrees / number of pixels)
       direction_index = courseChangeNeeded / (360 / PIXEL_COUNT);
 
-      /*char report[80];
-      snprintf(report, sizeof(report), "-> A: %6d %6d %6d\n-> M: %6d %6d %6d", compass.a.x, compass.a.y, compass.a.z, compass.m.x, compass.m.y, compass.m.z);
-      Serial.println(report);*/
       Serial.printf("-> LED: %d", direction_index);
 
       unsigned long currentBlinkTime = millis();
-      if (distanceToPizza <= UI_DISTANCE_ALERT)   // If we are within range of our target...
+      
+      // If we are within range of our target...
+      if (distanceToNextPub <= UI_DISTANCE_ALERT)
       {
         if (currentBlinkTime - lastBlinkTime >= UI_BLINK_TIME)
         {
@@ -355,126 +288,44 @@ void loop()
       }
         
       // Light the pixel for the direction we need to go
-      for (int i = 0; i < strip.numPixels(); i++) 
-      {
-        if (i == direction_index && blinkFlag == false)
-        {
-          if (direction_index == 0) // If we're facing in the direction of our target
-          {
-            strip.setPixelColor(i, strip.Color(0, 255, 0)); // Green
-          }
-          else
-          {
-            strip.setPixelColor(i, strip.Color(255, 0, 0)); // Red
+      for (int i = 0; i < rainbow.numPixels(); i++) {
+        
+        if (i == direction_index && blinkFlag == false){
+
+          // If we're facing in the direction of our target
+          if (direction_index == 0){
+            
+            rainbow.setPixelColor(i, COLOR32_GREEN);
+          }else{
+            
+            rainbow.setPixelColor(i, COLOR32_RED);
           }
         }
-        else
-          strip.setPixelColor(i, strip.Color(0, 0, 0));   // Turn off all others
+        else{
+          // Turn off all others
+          rainbow.setPixelColor(i, COLOR32_BLACK);
+        }
       }
 
-      strip.show();
+      rainbow.show();
     }
-  }
-}
-
-/* ------------------------ Particle.io ---------------------------- */
-
-void hookResponseHandler(const char *event, const char *data) 
-{
-  // Handle the integration response
-  // https://rickkas7.github.io/mustache/
-  char input_string[256];
-
-  requestRcv = true; 
-
-  // Parse the received data
-  memcpy(input_string, data, sizeof(input_string));
-
-  Serial.println("[*] Target acquired...");
-  //Serial.printf("-> Raw: %s", input_string); 
-  //Serial.println("");
-
-  target_lat = atof(strtok(input_string, ","));    // Extract first string from string sequence
-  target_lng = atof(strtok(NULL, ","));            // Extract second string from string sequence
-
-  Serial.printf("-> Name: %s", strtok(NULL, ",")); // Extract remainder of string sequence
-  Serial.printf("-> Target lat: %.10g", target_lat);
-  Serial.printf("-> Target long: %.10g", target_lng);
-}        
-
-/* ------------------------ Neopixel ------------------------------ */
-
-// Rainbow color wheel, makes the rainbow equally distributed, then wait (ms)
-void LED_RainbowCycle(unsigned long wait) 
-{
-  uint16_t i, j;
-
-  for (j = 0; j < 256; j++)  // 1 cycle of all colors on wheel
-  { 
-    for (i = 0; i < strip.numPixels(); i++) 
-    {
-      strip.setPixelColor(i, LED_Wheel(((i * 256 / strip.numPixels()) + j) & 255));
-    }
-    
-    strip.show();
-    delay(wait);
-  }
-}
-
-/* ---------------------------------------------------------------- */
-
-// Set all pixels in the strip to a solid color, then wait (ms)
-void LED_SetAll(uint32_t c, unsigned long wait) 
-{
-  uint16_t i;
-
-  for(i = 0; i < strip.numPixels(); i++) 
-  {
-    strip.setPixelColor(i, c);
-  }
   
-  strip.show();
-  delay(wait);
 }
 
-/* ---------------------------------------------------------------- */
+/* ************************* LED Functions ************************* */
 
-// Fill the dots one after the other with a color, wait (ms) after each one
-void LED_ColorWipe(uint32_t c, unsigned long wait) 
-{
-  uint16_t i;
-
-  for (i = 0; i < strip.numPixels(); i++) 
-  {
-    strip.setPixelColor(i, c);
-    strip.show();
-    delay(wait);
-  }
+// Ring1 Completion Callback
+void Ring1Complete(NeoPatterns *aLedsPtr){
+    
+    if (colourWipe.Color1 != 0){
+      colourWipe.ColorWipe(COLOR32_BLACK, 80, FLAG_DO_NOT_CLEAR, DIRECTION_UP);
+    }else{
+      colourWipe.ColorWipe(LEDColour, 80, 0, DIRECTION_UP); // light Blue
+    }
 }
 
-/* ---------------------------------------------------------------- */
+/* ************************* Compass - LSM303 - GY511 ************************* */
 
-// Input a value 0 to 255 to get a color value.
-// The colours are a transition r - g - b - back to r.
-uint32_t LED_Wheel(byte WheelPos) 
-{
-  if(WheelPos < 85) 
-  {
-    return strip.Color(WheelPos * 3, 255 - WheelPos * 3, 0);
-  } 
-  else if(WheelPos < 170) 
-  {
-    WheelPos -= 85;
-    return strip.Color(255 - WheelPos * 3, 0, WheelPos * 3);
-  } 
-  else 
-  {
-    WheelPos -= 170;
-    return strip.Color(0, WheelPos * 3, 255 - WheelPos * 3);
-  }
-}
-
-/* ------------------------ Magnetometer --------------------------- */
 // Code based on https://github.com/pololu/lsm303-arduino
 
 // Calibrate sensor by finding the range of X, Y, and Z values 
@@ -493,10 +344,11 @@ void Compass_Calibration(bool read_new_values)
     // Continually get readings until the button is pressed
     while (digitalRead(buttonStart) == 1)
     {
-      compass.read();  // Read all 6 channels of the LSM303 and stores them in the object variables
+      // Read all 6 channels of the LSM303 and stores them in the object variables
+      compass.read();
   
-      // Set minimum and maximum values of magnetometer readings
-      if (compass.m.x != 0.0 && compass.m.y != 0.0 && compass.m.z != 0)  // Ignore zero readings
+      // Set minimum and maximum values of magnetometer readings. Ignore 0 readings
+      if (compass.m.x != 0.0 && compass.m.y != 0.0 && compass.m.z != 0)
       {
         running_min.x = min(running_min.x, compass.m.x);
         running_min.y = min(running_min.y, compass.m.y);
@@ -506,16 +358,14 @@ void Compass_Calibration(bool read_new_values)
         running_max.y = max(running_max.y, compass.m.y);
         running_max.z = max(running_max.z, compass.m.z);
     
-        /*char report[80];
-        snprintf(report, sizeof(report), "min: {%6d, %6d, %6d}  max: {%6d, %6d, %6d}", running_min.x, running_min.y, running_min.z, running_max.x, running_max.y, running_max.z);     
-        Serial.println(report);*/
       }
       
       delay(5);
     }
 
     delay(100);
-    while (digitalRead(buttonStart) == 0); // Wait until button is released
+    // Wait until button is released
+    while (digitalRead(buttonStart) == 0);
     delay(100); 
 
     // Update global variables with calibrated results
@@ -524,7 +374,7 @@ void Compass_Calibration(bool read_new_values)
   }
 }
 
-/* ---------------------------------------------------------------- */
+/* ************************* Compass_DisplayCalibration ************************* */
 
 void Compass_DisplayCalibration(void)
 {
@@ -538,73 +388,31 @@ void Compass_DisplayCalibration(void)
   Serial.printf("-> Min Value (Z): %6d", compass.m_min.z);
 }
 
-/* ---------------------------------------------------------------- */
+/* ************************* Compass_Warmup ************************* */
 
 void Compass_Warmup(void) 
 {
   // Discard samples on power up
   for (int ignore = 0; ignore < 100; ignore++) 
   {
-    compass.read();  // Read all 6 channels of the LSM303
+    // Read all 6 channels of the LSM303
+    compass.read();
     delay(10);
   }
 }
 
-/* ---------------------------------------------------------------- */
+/* ************************* Compass_Error ************************* */
 
 void Compass_Error(void)
 {
   while (1)
   {
     // Blink LEDs to indicate failure
-    // Without a compass, we don't have much of a way to find pizza
-    LED_SetAll(strip.Color(0, 0, 255), 500);  // Blue
-    LED_SetAll(strip.Color(0, 0, 0), 500);    // Off
+    colourWipe.ColorSet(COLOR32_RED);
+    colourWipe.show();
+    delay(1000);
+    colourWipe.ColorSet(COLOR32_BLACK);
+    colourWipe.show();
+    delay(1000);
   }
 }
-
-/* ----------------------------- GPS ------------------------------- */
-
-void GPS_DisplayInfo(void)
-{
-  Serial.print(F("-> Local: ")); 
-  if (gps.location.isValid() == false)
-  {
-    Serial.print(F("INVALID! "));
-  }
-  Serial.print(gps.location.lat(), 6);
-  Serial.print(F(","));
-  Serial.print(gps.location.lng(), 6);
-
-  Serial.print(F("  Date/Time: "));
-  if (gps.date.isValid() == false)
-  {
-    Serial.print(F("INVALID! "));
-  }
-  Serial.print(gps.date.month());
-  Serial.print(F("/"));
-  Serial.print(gps.date.day());
-  Serial.print(F("/"));
-  Serial.print(gps.date.year());
-
-  Serial.print(F(" "));
-  if (gps.time.isValid() == false)
-  {
-    Serial.print(F("INVALID! "));
-  }
-  if (gps.time.hour() < 10) Serial.print(F("0"));
-  Serial.print(gps.time.hour());
-  Serial.print(F(":"));
-  if (gps.time.minute() < 10) Serial.print(F("0"));
-  Serial.print(gps.time.minute());
-  Serial.print(F(":"));
-  if (gps.time.second() < 10) Serial.print(F("0"));
-  Serial.print(gps.time.second());
-  Serial.print(F("."));
-  if (gps.time.centisecond() < 10) Serial.print(F("0"));
-  Serial.print(gps.time.centisecond());
-
-  Serial.println();
-}
-
-/* ------------------------ End of code! -------------------------- */
