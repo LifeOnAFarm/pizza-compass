@@ -32,8 +32,12 @@
 #define UI_BLINK_TIME       250
 
 // Test variables
-#define GPS_TARGET_LAT      53.0978374      // Kinnitty
-#define GPS_TARGET_LNG      -7.7192709
+//#define GPS_TARGET_LAT      53.0978374      // Kinnitty
+//#define GPS_TARGET_LNG      -7.7192709
+
+#define GPS_TARGET_LAT      53.098234      // Here
+#define GPS_TARGET_LNG      -7.728580333
+
 
 void Ring1Complete(NeoPatterns *aLedsPtr);
 
@@ -78,7 +82,7 @@ unsigned long lastPublishTime = 0;
 unsigned long lastBlinkTime = 0;
 
 
-/* ************************* Steup ************************* */
+/* ************************* Setup ************************* */
 
 void setup() {
 
